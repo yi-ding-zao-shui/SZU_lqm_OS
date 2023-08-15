@@ -1,0 +1,504 @@
+// 调用 clone()前需要分配好线程栈的内存空间，并通过 stack 参数传入
+int clone(void (*fcn)(void *), void *stack, void *arg)
+{
+    struct proc *curproc = myproc();
+    struct proc *np;
+
+    if ((np == allocproc()) == 0)
+    {
+        return -1;
+    }
+
+    np->pagetable = curproc->pagetable; // 线程间共用同一个页表
+
+    if ((np->trapframe = (struct trapframe *)kalloc()) == 0)
+    { // 分配线程内核栈空间
+        freeproc(np);
+        release(&np->lock);
+        return 0;
+    }
+
+    np->sz = curproc->sz;
+    np->pthread = curproc;
+    np->ustack = stack;
+    np->parent = 0;
+    *(np->trapframe) = *(curproc->trapframe);
+
+    if (mappages(np->pagetable, TRAPFRAME - PGSIZE, PGSIZE, (uint64)(np->trapframe), PTE_NX | PTE_P | PTE_W | PTE_MAT | PTE_D) < 0)
+    {
+        uvmfree(np->pagetable, 0);
+        return 0;
+    }
+
+    // 设置栈指针
+    np->trapframe->sp = (e)(stack + 4096 - 8);
+    // 修改返回值a0
+    np->trapframe->a0 = (uint64)arg;
+    // 修改返回地址
+    np->trapframe->era = (uint64)fcn;
+
+    // 复制文件描述符
+    for (int i = 0; i < NOFILE; i++)
+    {
+        if (curproc->ofile[i])
+        {
+            np->ofile[i] = filedup(curproc->ofile[i]);
+        }
+    }
+
+    np->cwd = idup(curproc->cwd);
+
+    safestrcpy(np->name, curproc->name, sizeof(curproc->name));
+    int pid = np->pid;
+
+    release(&np->lock);
+
+    acquire(&np->lock);
+    np->state = RUNNABLE;
+    release(&np->lock);
+
+    // 返回新线程的 pid
+    return pid;
+}
+
+
+int join() {
+    struct proc* curproc = myproc();
+    struct proc* p;
+
+    int havekids;
+
+    while(1) {
+        havekids = 0;
+        for (p = proc; p < &proc[NPROC]; p++) {
+            if (p->pthread != curproc) {
+                continue;
+            }
+
+            havekids = 1;
+            if (p->state == ZOMBIE) {
+                acquire(&p->lock);
+                if (p->trapframe) {
+                    kfree((void*)p->trapframe);
+                }
+                p->trapframe = 0;
+                if (p->pagetable) {
+                    uvmunmap(p->pagetable, TRAPFRAME - PGSIZE, 1, 0);
+                }
+
+                p->pagetable = 0;
+                p->sz = 0;
+                p->pid = 0;
+                p->parent = 0;
+                p->pthread = 0;
+                p->name[0] = 0;
+                p->chan = 0;
+                p->killed = 0;
+                p->xstate = 0;
+                p->state = UNUSED;
+
+                int pid = p->pid;
+
+                release(&p->lock);
+                return pid;
+            }
+        }
+
+        if (!havekids || curproc->killed) {
+            return -1;
+        }
+        sleep(curproc, &wait_lock);
+    } 
+    return 0;
+}
+
+uint64 sys_clone(void){
+    uint64 a, b, c;
+    argaddr(0, &a);
+    argaddr(1, &b);
+    argaddr(2, &c);
+    return (uint64)clone((void (*)(void *))a,(void*)b, (void *)c);
+}
+
+
+uint64 sys_join(void) {
+    return (uint64)join();
+}
+
+// Parent might be sleeping in join().
+if (p->parent == 0 && p->pthread != 0)
+    wakeup(p->pthread);
+else 
+    wakeup(p->parent);
+
+
+#include "kernel/types.h"
+#include "user/user.h"
+
+#define NTHREAD 4   // 单进程的最大线程数（不包含主线程）
+#define PGSIZE 4096
+struct {
+    int pid;
+    void* ustack;
+    int used;
+} threads[NTHREAD]; // TCB表
+
+void add_thread(int* pid, void* ustack) {
+    for (int i = 0; i < NTHREAD; i++) {
+        if (threads[i].used == 0) {
+            threads[i].pid = *pid;
+            threads[i].ustack = ustack;
+            threads[i].used = 1;
+            break;
+        }
+    }
+}
+
+void remove_thread(int* pid) {
+    for (int i = 0; i < NTHREAD; i++) {
+        if (threads[i].used && threads[i].pid == *pid) {
+            free(threads[i].ustack);
+            threads[i].pid = 0;
+            threads[i].used = 0;
+            break;
+        }
+    }
+}
+
+int create_thraed(void(*start_routine)(void*), void* arg) {
+    // If first time running any threads, initialize thread table with zeros
+    static int first = 1;
+    if (first) {
+        first = 0;
+        for (int i = 0; i < NTHREAD; i++) {
+            threads[i].pid = 0;
+            threads.ustack = 0;
+            threads[i].used = 0;
+        }
+    }
+
+    void* stack = malloc(PGSIZE); // allocate one page for user stack
+    int pid = clone(start_routine, stack, (void*)arg);  // system call for kernel thread
+    add_thread(&pid, stack); // save new thread to thread table
+    return pid;
+}
+
+int join_thread(void) {
+    for (int i = 0; i < NTHREAD; i++) {
+        if (threads[i].used == 1) {
+            int pid = join(); // 回收子线程
+            if (pid > 0) {
+                remove_thread(&pid);
+                return pid;
+            }
+        }
+    }
+    return 0;
+}
+
+void printTCB(void) {
+    for (int i = 0; i < NTHREAD; i++) {
+        printf("TCB %d : %d\n", i, threads[i].used);
+    }
+}
+
+// jump to uservec.S at the top of memory, which
+// switches to the user page table, restores user registers,
+// and switches to user mode with ertn.
+// userret(TRAPFRAME, pgdl);
+if (p->pthread == 0) {
+    userret(TRAPFRAME, pgdl);
+} else {
+    userret(TRAPFRAME - PGSIZE, pgdl);
+}
+
+#include "kernel/fcntl.h"
+#include "kernel/types.h"
+#include "user/uthread.h"
+#include "user/user.h"
+
+volatie int global = 1;
+int F(int n) {
+    if (n < 0) {
+        printf("input a postive integer\n");
+    } else if (n == 1 || n == 2) {
+        return 1;
+    } else {
+        return F(n - 1) + F(n - 2);
+    }
+    return 0;
+}
+
+void worker(void* arg) {
+    global = 100;
+    printf("thread %d is worker.\n", *(int*)arg);
+    global = F(15);
+    write(3, "hello\n", 6);
+    exit(0);
+}
+
+int main() {
+    int t = 1;
+    open("tmp", O_RDWR | O_CREATE);
+    int pid = create_thraed(worker, &t);
+    sleep(10);
+    join_thread();
+    printf("thread id = %d\n", pid);
+    printf("global = %d\n", global);
+    exit(0);
+}
+
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+// 文件系统实验之添加文件读写权限控制
+char mode; // 文件权限
+char type; // File type
+
+int chmod(const char* pathname, char mode);
+
+uint64 sys_chmod(void) {
+    char* pathname = "";
+    int mode;
+    struct inode* ip;
+    if (argstr(0, pathname, 20) < 0) {
+        return -1;
+    }
+    if (argint(1, &mode) < 0) {
+        return -1;
+    }
+
+    begin_op();
+
+    if ((ip = namei((char*)pathname)) == 0) {
+        end_op();
+        return -1;
+    }
+
+    ilock(ip);
+
+    ip->mode = mode;
+
+    iupdate(ip);
+    iunlock(ip);
+
+    end_op();
+    return 0;
+}
+
+if (f->type == FD_INODE) {          // 文件类型
+    ilock(f->ip);                   // 索引节点
+    if ((f->ip->mode & 1) == 0) {   // 不可读
+        iunlock(f->ip);           
+        return -1;                  // 表示读操作失败
+    }
+}
+
+if (f->type == FD_INODE) {
+    begin_op();
+    ilock(f->ip);
+    if ((f->ip->mode & 2) == 0) {   // 判断是否可写
+        iunlock(f->ip);
+        end_op();
+        return -1;                  // 表示写操作失败
+    }
+}
+
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+
+int main(int argc, char* argv[]) {
+    if (argc <= 2) {
+        printf("format: chmod pathname mode\n");
+    }
+    chmod(argv[1], atoi(argv[2]));
+    exit(0);
+}
+
+
+// -----------------------------------------------------
+// -----------------------------------------------------
+// 虚拟内存交换实验
+
+void read_page_from_disk(int dev, char* pa, uint blockno) {
+    struct buf* b;
+    for (int i = 0; i < 4; i++) {
+        b = bread(9dev, blockno + i);
+        memmove((void*)(pa + i * 1024), b->data, 1024);
+        brelse(b);
+    }
+} 
+
+void write_page_to_disk(int dev, char* pa, uint blockno) {
+    begin_op();
+    struct buf* b;
+    for (int i = 0; i < 4; i++) {
+        b = bread(dev, blockno + i);
+        memmove(b->data, (void*)((uint64)(pa + i * 1024) | DMWIN_MASK), 1024);
+        bwrite(b);
+        brelse(b);
+    }
+    end_op();
+}
+
+uint balloc4(uint dev) {
+    for (uint b = 0; b < sb.size; b += BPB) {
+        struct buf* bp = bread(dev, BBLOCK(b, sb));
+        for (uint bi = 0; bi < BPB && b + bi < sb.size; bi += 8) {
+            if (bp->data[bi / 8] == 0) {
+                bp->data[bi / 8] = 0xff;
+                bwrite(bp);
+                brelse(bp);
+                return b + bi;
+            }
+        }
+        brelse(bp);
+    }
+    panic("balloc: out of blocks");
+}
+
+void bfree4(int dev, uint b) {
+    for (uint i = 0; i < 4; i++) {
+        bfree(dev, b + i);
+    }
+}
+
+void pgfault() {
+    uint64 addr = PGROUNDDOWN(r_csr_badv());
+    struct proc* proc = myproc();
+    char* mem;
+
+    if (r_csr_badv() > proc->sz) {
+        printf("kalloc out of memory! %p %d\n", addr, proc->pid);
+        proc->killed = 1;
+        return;
+    }
+
+    mem = kalloc();
+    while(mem == 0) {
+        printf("执行换出操作\n");
+        swapout(myproc());
+        mem = kalloc();
+    }
+
+    pte_t* pte = walk(proc->pagetable, addr, 1);
+
+    if ((*pte & PTE_SWAPPED) == 0) {
+        memset(mem, 0, PGSIZE);
+    } else {
+        printf("将物理页从磁盘调入内存\n");
+        swapin(mem, pte);
+    }
+
+    *pte = (*pte & (~PTE_V));
+
+    mappages(proc->pagetable, addr, PGSIZE, (uint64)mem, PTE_PLV | PTE_P | PTE_W | PTE_MAT | PTE_D);
+}
+
+static inline uint32 r_csr_badv() {
+    uint32 x;
+    asm volatile("csrrd %0, 0x7" : "=r" (x));
+    return x;
+}
+
+void swapout(struct proc* p) {
+    pte_t* pte;
+    pagetable_t pgdir = p->pagetable;
+    uint64 a = p->sz - 1;
+    a = PGROUNDDOWN(a);
+
+    for (; a >= p->swap_start; a -= PGSIZE) {
+        pte = walk(pgdir, a, 0);
+        if (*pte & PTE_P && ((*pte & PTE_SWAPPED) == 0)) {
+            uint64 pa = walkaddr(pgdir, a);
+            uint blockno = balloc4(1);
+            write_page_to_disk(1, (void *)pa, blockno); // 写入磁盘
+            kfree((void *)(pa | DMWIN_MASK));           //释放对应的页帧
+            *pte = (blockno << 12);                     // 记录盘块号
+            *pte = (*pte | PTE_SWAPPED);                //将其 swapped 位置 1
+            return;
+        }
+    }
+}
+
+void swapin(char* mem, pte_t *pte) {    // 线性地址、页表项
+    uint blockno = ((uint)*pte >> 12);  // 取磁盘号
+    read_page_from_disk(1, mem, blockno); 
+}
+
+#define PTE_SWAPPED (1L << 5) //swapped to disk
+
+void uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free) {
+    uint64 a;
+    pte_t* pte;
+
+    if ((va % PGSIZE) != 0) {
+        panic("uvmunmap: not aligned");
+    }
+
+    for (a = va; a < va + npages * PGSIZE; a += PGSIZE) {
+        if((pte = walk(pagetable, a, 0)) == 0) {
+            continue;
+        }
+    }
+
+    if (*pte == 0) {
+        continue;
+    }
+
+    if (PTE_FLAGS(*pte) == PTE_V) {
+        panic("uvmunmap: not a leaf");
+    }
+
+    if (do_free) {
+        if((*pte & PTE_SWAPPED) == 0) {
+            uint64 pa = PTE2PA(*pte);
+            kfree((void*)(pa | DMWIN_MASK));
+        }
+    }
+
+    *pte = 0;
+}
+
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+
+void mem(void) {
+    bstat();
+    char *addrTable[11];
+    for(int i = 0; i < 4; i++) {
+        addrTable[i] = sbrk(4096);
+    }
+    printf("----------------------------\n");
+
+    for(int i = 0; i < 4; i++) {
+        addrTable[i][1] = 'a' + i;
+        bstat();
+    }
+    printf("----------------------------\n");
+    printf("访问第四个页，其内容是%c，不发生缺页异常\n",addrTable[3][1]);
+    printf("下面展示缺页异常的交换功能：\n");
+
+    for(int i = 0, cnt = 1; i < 4;i ++, cnt++) {
+        bstat();
+        printf("第%d 个页的内容是：%c\n", cnt, addrTable[i][1]);
+        sleep(3);
+    }
+}
+
+int main(void) {
+    bstat();
+    char* s = 0;
+
+    // 先把页帧数量减少，便于观察实验
+    for (int i = 1; i <= 238; i++) {
+        s = sbrk(4096);
+        s[1] = 1;
+    }
+
+    bstat();
+    mem();
+    exit(0);
+    return 0;
+}
